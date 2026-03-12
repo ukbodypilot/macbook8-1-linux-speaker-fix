@@ -664,6 +664,17 @@ static void cs4208_fixup_macbook8_1(struct hda_codec *codec,
 		 */
 		snd_hda_codec_write(codec, 0x24, 0,
 				    AC_VERB_SET_PROC_STATE, 0x00);
+		/*
+		 * Node 0x0a is an 8-channel digital output converter that feeds
+		 * pin 0x1d → external I2C amplifier → internal speakers. The HDA
+		 * generic layer uses it as the speaker DAC but never sets the
+		 * digital enable bit (it only does so for SPDIF paths). Without
+		 * AC_DIG1_ENABLE the converter outputs nothing regardless of
+		 * stream assignment. Set it explicitly here; it is re-applied on
+		 * every codec resume because cs_init() runs the ACT_INIT fixup.
+		 */
+		snd_hda_codec_write(codec, 0x0a, 0,
+				    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
 	}
 }
 

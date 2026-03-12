@@ -43,6 +43,16 @@
 +		 */
 +		snd_hda_codec_write(codec, 0x24, 0,
 +				    AC_VERB_SET_PROC_STATE, 0x00);
++		/*
++		 * Node 0x0a is an 8-channel digital output converter feeding
++		 * pin 0x1d → external I2C amp → internal speakers. The HDA
++		 * generic layer assigns it as the speaker DAC but never sets
++		 * AC_DIG1_ENABLE (only done for SPDIF paths). Without it the
++		 * converter outputs nothing. Re-applied on every codec resume
++		 * because cs_init() runs ACT_INIT on resume.
++		 */
++		snd_hda_codec_write(codec, 0x0a, 0,
++				    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
 +	}
 +}
 +
