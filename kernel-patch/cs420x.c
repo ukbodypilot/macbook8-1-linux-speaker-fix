@@ -650,31 +650,169 @@ static int cs4208_spdif_sw_put(struct snd_kcontrol *kcontrol,
 	return spec->spdif_sw_put(kcontrol, ucontrol);
 }
 
+/*
+ * PCM hook for MacBook8,1: fires the CS4208 I2S master-clock activation
+ * sequence at stream-prepare time, faithfully reproducing play_a1534().
+ *
+ * Key observations from play_a1534() and headphones_a1534() in macOS driver:
+ *  - macOS assigns HDA stream tag 1 to BOTH node 0x02 (analog DAC) AND node
+ *    0x0a (I2S digital output). Both nodes share the same DMA stream.
+ *  - On Linux the HDA core assigns a different stream tag to node 0x02.
+ *    We read it back and mirror it onto node 0x0a so node 0x0a has actual
+ *    PCM data. Without a real DMA stream, node 0x0a generates no I2S clocks.
+ *  - macOS sets DIGI_CONVERT_1 = 0x11 (AC_DIG1_ENABLE | AC_DIG1_COPYRIGHT)
+ *    before going to D3, then 0x10 (AC_DIG1_COPYRIGHT only, ENABLE cleared)
+ *    just before vendor verb 0x7f0=0x03. Note: AC_DIG1_NONAUDIO = (1<<5) =
+ *    0x20, which is NOT 0x10; macOS uses bit4 (COPYRIGHT=0x10), not bit5.
+ */
+static void cs4208_mb8_pcm_hook(struct hda_pcm_stream *hinfo,
+				struct hda_codec *codec,
+				struct snd_pcm_substream *substream,
+				int action)
+{
+	unsigned int stream_id;
+
+	if (action == HDA_GEN_PCM_ACT_CLEANUP) {
+		codec_info(codec, "mb8_pcm_hook CLEANUP: 0x0a CONV=0x%x\n",
+			   snd_hda_codec_read(codec, 0x0a, 0, AC_VERB_GET_CONV, 0));
+		return;
+	}
+	if (action != HDA_GEN_PCM_ACT_PREPARE)
+		return;
+
+	/*
+	 * Read the stream tag that the HDA core assigned to node 0x02 (the
+	 * analog DAC). We will mirror it onto node 0x0a (digital I2S output)
+	 * so both nodes share the same DMA stream — exactly as macOS does.
+	 * AC_VERB_GET_CONV returns (stream_tag << 4) | channel_id.
+	 */
+	stream_id = snd_hda_codec_read(codec, 0x02, 0, AC_VERB_GET_CONV, 0);
+	codec_info(codec, "mb8_pcm_hook: node 0x02 GET_CONV=0x%x (stream_id to apply)\n",
+		   stream_id);
+
+	/* Step 1: bring AFG and node 0x0a to D0 */
+	snd_hda_codec_write(codec, codec->core.afg, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+
+	/* Step 2: toggle DIGI_CONVERT_1 0x01→0x00 to reset converter state */
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, 0x01);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, 0x00);
+
+	/* Step 3: set stream format on node 0x0a (44.1kHz, 16-bit, 4ch) */
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_STREAM_FORMAT, 0x4013);
+
+	/* Step 4: set digital control bits in sequence per macOS.
+	 * macOS writes 0x01, 0x01 (DIGI_CONVERT_2=0x01), then 0x11.
+	 * 0x11 = AC_DIG1_ENABLE(bit0) | AC_DIG1_COPYRIGHT(bit4).
+	 * Note: AC_DIG1_NONAUDIO is bit5=0x20, NOT what macOS uses here.
+	 */
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_2, 0x01);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1,
+			    AC_DIG1_ENABLE | AC_DIG1_COPYRIGHT);
+
+	/* Step 5: mirror the analog DAC's stream tag onto node 0x0a */
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_CHANNEL_STREAMID, stream_id);
+
+	/* Step 6: enable VPW twice (macOS does two back-to-back writes) */
+	snd_hda_codec_write(codec, 0x24, 0, AC_VERB_SET_PROC_STATE, 0x01);
+	snd_hda_codec_write(codec, 0x24, 0, AC_VERB_SET_PROC_STATE, 0x01);
+
+	/* Step 7: go to D3, then CLEAR ENABLE (keep only COPYRIGHT=0x10)
+	 * before vendor verb — macOS writes 0x10 here (bit4 only), not 0x11 */
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D3);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_COPYRIGHT);
+
+	/* Step 8: vendor verb — trigger I2S master clock generator */
+	snd_hda_codec_write(codec, 0x0a, 0, 0x7f0, 0x03);
+
+	/* Step 9: wake to D0 and restore DIGI_CONVERT + stream tag.
+	 * macOS reads back 0x110 here (DIGI2=0x01, DIGI1=0x10 COPYRIGHT),
+	 * then writes 0x11 (ENABLE|COPYRIGHT) before re-applying STREAMID. */
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1,
+			    AC_DIG1_ENABLE | AC_DIG1_COPYRIGHT);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_CHANNEL_STREAMID, stream_id);
+
+	/* Step 10: enable sibling digital nodes 0x0b/0x0c/0x0d */
+	snd_hda_codec_write(codec, 0x0b, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+	snd_hda_codec_write(codec, 0x0b, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
+	snd_hda_codec_write(codec, 0x0b, 0,
+			    AC_VERB_SET_CHANNEL_STREAMID, 0x00);
+	snd_hda_codec_write(codec, 0x0b, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D3);
+
+	snd_hda_codec_write(codec, 0x0c, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+	snd_hda_codec_write(codec, 0x0c, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
+	snd_hda_codec_write(codec, 0x0c, 0,
+			    AC_VERB_SET_CHANNEL_STREAMID, 0x00);
+	snd_hda_codec_write(codec, 0x0c, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D3);
+
+	snd_hda_codec_write(codec, 0x0d, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D0);
+	snd_hda_codec_write(codec, 0x0d, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
+	snd_hda_codec_write(codec, 0x0d, 0,
+			    AC_VERB_SET_CHANNEL_STREAMID, 0x00);
+	snd_hda_codec_write(codec, 0x0d, 0,
+			    AC_VERB_SET_POWER_STATE, AC_PWRST_D3);
+
+	/* Step 11: connect and enable speaker pin 0x1d */
+	snd_hda_codec_write(codec, 0x1d, 0, AC_VERB_SET_CONNECT_SEL, 0x00);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_2, 0x01);
+	snd_hda_codec_write(codec, 0x0a, 0,
+			    AC_VERB_SET_DIGI_CONVERT_1,
+			    AC_DIG1_ENABLE | AC_DIG1_COPYRIGHT);
+	snd_hda_codec_write(codec, 0x1d, 0,
+			    AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT);
+
+	/* Step 12: GPIO — direction=0x31, data=0x01 (GPIO[0]=1 EAPD), mask=0x37 */
+	snd_hda_codec_write(codec, codec->core.afg, 0,
+			    AC_VERB_SET_GPIO_DIRECTION, 0x31);
+	snd_hda_codec_write(codec, codec->core.afg, 0,
+			    AC_VERB_SET_GPIO_DATA, 0x01);
+	snd_hda_codec_write(codec, codec->core.afg, 0,
+			    AC_VERB_SET_GPIO_MASK, 0x37);
+
+	/* Debug: read back node 0x0a state at end of hook */
+	codec_info(codec, "mb8_pcm_hook END: 0x0a CONV=0x%x DIGI=0x%x PWR=0x%x\n",
+		   snd_hda_codec_read(codec, 0x0a, 0, AC_VERB_GET_CONV, 0),
+		   snd_hda_codec_read(codec, 0x0a, 0, AC_VERB_GET_DIGI_CONVERT_1, 0),
+		   snd_hda_codec_read(codec, 0x0a, 0, AC_VERB_GET_POWER_STATE, 0));
+}
+
 static void cs4208_fixup_macbook8_1(struct hda_codec *codec,
 				    const struct hda_fixup *fix, int action)
 {
-	if (action == HDA_FIXUP_ACT_INIT) {
+	struct cs_spec *spec = codec->spec;
+
+	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		/*
-		 * MacBook8,1 (12" Early 2015): cs4208_coef_init_verbs enables
-		 * VPW/DSP processing on node 0x24 (SET_PROC_STATE=1), but the
-		 * DSP coefficients are not initialised for this model. The
-		 * uninitialised DSP appears to block the internal speaker output
-		 * path entirely. Disable VPW so audio bypasses the DSP and
-		 * reaches the speaker output pins directly.
+		 * Register PCM hook so the I2S clock sequence fires at
+		 * stream-prepare time, after the stream format is set by the
+		 * HDA generic layer.
 		 */
-		snd_hda_codec_write(codec, 0x24, 0,
-				    AC_VERB_SET_PROC_STATE, 0x00);
-		/*
-		 * Node 0x0a is an 8-channel digital output converter that feeds
-		 * pin 0x1d → external I2C amplifier → internal speakers. The HDA
-		 * generic layer uses it as the speaker DAC but never sets the
-		 * digital enable bit (it only does so for SPDIF paths). Without
-		 * AC_DIG1_ENABLE the converter outputs nothing regardless of
-		 * stream assignment. Set it explicitly here; it is re-applied on
-		 * every codec resume because cs_init() runs the ACT_INIT fixup.
-		 */
-		snd_hda_codec_write(codec, 0x0a, 0,
-				    AC_VERB_SET_DIGI_CONVERT_1, AC_DIG1_ENABLE);
+		spec->gen.pcm_playback_hook = cs4208_mb8_pcm_hook;
 	}
 }
 
